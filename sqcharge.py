@@ -1,5 +1,13 @@
 """
-sqcharge.py — Square gate module (v75)
+sqcharge.py — Square gate module (v78)
+
+v78 — REAL PROCESSOR CODE RULE:
+  `status` in every result is the processor's REAL code verbatim
+  (GENERIC_DECLINE, CARD_DECLINED_VERIFICATION_REQUIRED, CARD_EXPIRED,
+  PAN_FAILURE, ...). The friendly label travels separately in
+  `status_group` (3DS_REQUIRED / DECLINED / EXPIRED_CARD / ...).
+  Works with sqapi v4.2.1+ (status_group/error_code/http_status/three_ds
+  fields) AND older APIs (re-derives the real code from raw.errors).
 
 Wraps the v3.0 sqapi (checker.check_one_sync / check_multi_sync) so the bot
 can call it the same way it calls shopify_check_card / st1_check_card.
@@ -79,8 +87,8 @@ SQUARE_USER_MAX_CARDS   = 200       # key-redeemed users
 SQUARE_ADMIN_MAX_CARDS  = 500       # admins
 SQUARE_OWNER_MAX_CARDS  = 10_000_000  # owner
 
-# /sq accepts 1-5 cards inline
-SQUARE_SINGLE_MAX_CARDS = 5
+# /sq accepts 1-20 cards inline, checked SEQUENTIALLY (v78 user spec)
+SQUARE_SINGLE_MAX_CARDS = 20
 
 # Bulk processor: 3 concurrent requests per API
 SQUARE_BULK_PER_API     = 3
@@ -254,6 +262,48 @@ def _pick_random_square_site() -> str:
     return random.choice(sites)
 
 
+def filter_expired_cards(ccs: list) -> tuple[list, list]:
+    """v78 — Auto-cut expired cards BEFORE checking (user spec: MUST).
+
+    A card is expired when its MM/YY is before the CURRENT month.
+    Returns (valid_cards, expired_cards). Cards with unparseable dates
+    are kept — the processor gets the final word.
+    """
+    import calendar as _cal
+    try:
+        from datetime import datetime as _dtmod
+        now = _dtmod.now()
+    except Exception:
+        return list(ccs), []
+    valid: list = []
+    expired: list = []
+    for cc in ccs:
+        parts = str(cc).split("|")
+        if len(parts) < 4:
+            valid.append(cc)
+            continue
+        try:
+            mm = int(parts[1])
+            yy = int(parts[2])
+            if yy < 100:
+                yy = 2000 + yy
+            if mm < 1 or mm > 12:
+                expired.append(cc)
+                continue
+            if yy < now.year or (yy == now.year and mm < now.month):
+                expired.append(cc)
+                continue
+            # expiry month itself is still valid (runs to the last day)
+            last_day = _cal.monthrange(yy, mm)[1]
+            if last_day < 1:
+                expired.append(cc)
+                continue
+            valid.append(cc)
+        except (ValueError, IndexError):
+            valid.append(cc)
+    return valid, expired
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  BULK PROCESSOR STATE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -330,110 +380,120 @@ _REASON_MAP = {
 }
 
 
-def _classify_square(result: dict, amount_cents: int = 100) -> tuple[str, str, str]:
-    """Classify a sqapi result dict into (status, response, reason).
+def _group_from_code(code: str) -> str:
+    """v78 — friendly bucket of a REAL processor code (never replaces it)."""
+    c = (code or "").upper()
+    if not c:
+        return "UNKNOWN"
+    if c == "SESSION_EXPIRED":
+        return "SESSION_EXPIRED"
+    if "VERIFICATION_REQUIRED" in c or "3DS" in c or "AUTHENTICATION" in c:
+        return "3DS_REQUIRED"
+    if "EXPIRED" in c or "EXPIRATION" in c:
+        return "EXPIRED_CARD"
+    if "INSUFFICIENT" in c:
+        return "INSUFFICIENT_FUNDS"
+    if "CVV" in c or "SECURITY_CODE" in c:
+        return "CVV_MISMATCH"
+    if "PAN_FAILURE" in c or "INVALID_PAN" in c or "INVALID_CARD" in c:
+        return "INVALID_CARD"
+    if "RATE_LIMITED" in c or "BAD_REQUEST" in c or "INVALID_REQUEST" in c:
+        return "ERROR"
+    if "GENERIC_DECLINE" in c or "DECLIN" in c or "TRANSACTION_LIMIT" in c \
+       or "CARD_VELOCITY" in c or "ADDRESS_VERIFICATION" in c or "NOT_SUPPORTED" in c \
+       or "INVALID_REGION" in c or "PIN" in c or "PROCESSING_ERROR" in c \
+       or "NO_CHECKING" in c or "NO_SAVINGS" in c or "CALL_ISSUER" in c:
+        return "DECLINED"
+    return c  # unknown real code → the group IS the code (no invention)
 
-    The `result` dict is what sqapi's checker.check_one_sync returns:
-      {
-        "status": "APPROVED" | "DECLINED" | ...,
-        "raw": { "payment": { "id": ..., "status": ..., "card_details": {...} }, "errors": [...] },
-        "response": "...",
-        ...
-      }
+
+_GROUP_REASON = {
+    "APPROVED":           "Payment Successful",
+    "3DS_REQUIRED":       "3D Secure verification required",
+    "EXPIRED_CARD":       "Expired card",
+    "INSUFFICIENT_FUNDS": "Insufficient funds — Live CC low funds",
+    "CVV_MISMATCH":       "Incorrect CVV",
+    "INVALID_CARD":       "Invalid card",
+    "DECLINED":           "Card declined by issuer",
+    "SESSION_EXPIRED":    "Checkout link expired or invalid",
+    "ERROR":              "Square API error",
+}
+
+
+def _classify_square(result: dict, amount_cents: int = 100) -> tuple[str, str, str, str]:
+    """v78 — classify a sqapi result into (status, status_group, response, reason).
+
+    THE REAL CODE RULE: `status` is ALWAYS the processor's REAL code verbatim
+    (GENERIC_DECLINE, CARD_DECLINED_VERIFICATION_REQUIRED, CARD_EXPIRED,
+    PAN_FAILURE, ...). It is NEVER replaced by a generic label — the friendly
+    bucket travels separately in `status_group`.
+
+    Works with BOTH sqapi generations:
+      * v4.2.1+ returns ready fields:
+          status=<REAL CODE>, status_group=<bucket>, error_code=<REAL CODE>,
+          http_status=422, three_ds={...}, response=<processor detail>
+      * older APIs return mapped labels + raw — the real code is re-derived
+        from raw.errors[0].code / payment.card_details.errors[0].code.
     """
     if not isinstance(result, dict):
-        return "ERROR", "No response", "Square API returned non-dict result"
+        return ("ERROR", "ERROR", "No response", "Square API returned non-dict result")
 
-    # Pull the raw Square processor response
-    raw = result.get("raw") or {}
-    payment = (raw.get("payment") or {}) if isinstance(raw, dict) else {}
-    card_details = (payment.get("card_details") or {}) if isinstance(payment, dict) else {}
-    errs = (raw.get("errors") or card_details.get("errors") or []) if isinstance(raw, dict) else []
-    pay_status = str(payment.get("status", "")).upper() if isinstance(payment, dict) else ""
-    cd_status = str(card_details.get("status", "")).upper() if isinstance(card_details, dict) else ""
+    raw = result.get("raw")
+    if not isinstance(raw, dict):
+        raw = {}
+    payment = raw.get("payment")
+    if not isinstance(payment, dict):
+        payment = {}
+    card_details = payment.get("card_details")
+    if not isinstance(card_details, dict):
+        card_details = {}
+    errs = raw.get("errors") or card_details.get("errors") or []
+    if not isinstance(errs, list):
+        errs = []
+    pay_status = str(payment.get("status", "")).upper()
+    cd_status = str(card_details.get("status", "")).upper()
 
-    # APPROVED — payment.status COMPLETED + card_details.status CAPTURED (Square docs)
+    # ── APPROVED — real success (Square: payment COMPLETED + card CAPTURED) ──
     if pay_status in ("COMPLETED", "APPROVED", "CAPTURED", "AUTHORIZED") or \
        cd_status in ("CAPTURED", "AUTHORIZED", "APPROVED"):
-        payment_id = payment.get("id", "") if isinstance(payment, dict) else ""
-        return ("APPROVED",
+        payment_id = str(payment.get("id", "") or "")
+        return ("APPROVED", "APPROVED",
                 f"Payment ID: {payment_id}" if payment_id else "Payment Successful",
                 "Payment Successful")
 
-    # Extract the first error code
-    err_code = ""
-    err_detail = ""
-    if errs and isinstance(errs[0], dict):
-        err_code = str(errs[0].get("code", "")).upper()
-        err_detail = str(errs[0].get("detail", "") or err_code)
-
-    # If no error code and payment status is FAILED, use GENERIC_DECLINE
+    # ── Extract the REAL processor code + detail ─────────────────────────
+    err_code = str(result.get("error_code", "") or "").strip().upper()
+    err_detail = str(result.get("response", "") or "").strip()
+    if err_detail == "-":
+        err_detail = ""
+    if not err_code and errs and isinstance(errs[0], dict):
+        err_code = str(errs[0].get("code", "") or "").strip().upper()
+    if not err_detail and errs and isinstance(errs[0], dict):
+        err_detail = str(errs[0].get("detail", "") or errs[0].get("message", "") or "").strip()
     if not err_code and pay_status == "FAILED":
         err_code = "GENERIC_DECLINE"
-        err_detail = "Authorization error: 'GENERIC_DECLINE'"
+    if err_code and not err_detail:
+        err_detail = f"Authorization error: '{err_code}'"
 
-    # Map error code → status + reason
-    if err_code in ("PAN_FAILURE", "INVALID_PAN", "INVALID_CARD", "INVALID_CARD_DATA"):
-        return ("INVALID_CARD",
-                f"Authorization error: '{err_code}'",
-                _REASON_MAP.get(err_code, "Invalid card"))
-    if err_code in ("CVV_FAILURE", "INCORRECT_CVV", "INVALID_SECURITY_CODE", "CVV_MISMATCH"):
-        return ("CVV_MISMATCH",
-                f"Authorization error: '{err_code}'",
-                _REASON_MAP.get(err_code, "Incorrect CVV"))
-    if err_code in ("EXPIRED_CARD", "EXPIRED_CARD_FAILURE", "EXPIRATION_FAILURE"):
-        return ("EXPIRED_CARD",
-                f"Authorization error: '{err_code}'",
-                _REASON_MAP.get(err_code, "Expired card"))
-    if err_code in ("INSUFFICIENT_FUNDS", "INSUFFICIENT_FUNDS_FAILURE", "GIFT_CARD_AVAILABLE_AMOUNT"):
-        return ("INSUFFICIENT_FUNDS",
-                f"Authorization error: '{err_code}'",
-                _REASON_MAP.get(err_code, "Insufficient funds — Live CC low funds"))
-    if err_code in ("TRANSACTION_LIMIT", "TRANSACTION_LIMIT_FAILED",
-                     "CARD_VELOCITY", "CARD_VELOCITY_EXCEEDED",
-                     "PAYMENT_LIMIT_EXCEEDED"):
-        return ("DECLINED",
-                f"Authorization error: '{err_code}'",
-                _REASON_MAP.get(err_code, "Transaction limit exceeded"))
-    if err_code in ("3DS_REQUIRED", "AUTHENTICATION_REQUIRED",
-                     "CARD_DECLINED_VERIFICATION_REQUIRED", "VERIFICATION_REQUIRED"):
-        return ("3DS_REQUIRED",
-                f"Authorization error: '{err_code}'",
-                _REASON_MAP.get(err_code, "3D Secure verification required"))
-    if err_code == "RATE_LIMITED":
-        return ("ERROR",
-                f"Authorization error: '{err_code}'",
-                "Square rate-limited — retry later")
-    if err_code in ("BAD_REQUEST", "INVALID_REQUEST_ERROR", "INVALID_VALUE"):
-        return ("ERROR",
-                err_detail or f"Authorization error: '{err_code}'",
-                _REASON_MAP.get(err_code, "Bad request"))
-    if err_code in ("GENERIC_DECLINE", "DECLINE", "DECLINED", "CARD_DECLINED",
-                     "CARD_NOT_SUPPORTED", "INVALID_REGION",
-                     "ADDRESS_VERIFICATION_FAILURE",
-                     "CARD_DECLINED_CALL_ISSUER", "CARD_DECLINED_EXPIRED_CARD",
-                     "CARD_DECLINED_INVALID_CVV", "CARD_DECLINED_INVALID_EXPIRATION",
-                     "CARD_DECLINED_INVALID_PIN", "CARD_DECLINED_PIN_TRIES_EXCEEDED",
-                     "CARD_DECLINED_PROCESSING_ERROR", "CARD_DECLINED_NO_CHECKING_ACCOUNT",
-                     "CARD_DECLINED_NO_SAVINGS_ACCOUNT"):
-        return ("DECLINED",
-                f"Authorization error: '{err_code}'",
-                _REASON_MAP.get(err_code, "Card declined by issuer"))
+    # ── No processor code present → transport / session layer ───────────
+    if not err_code:
+        top_status = str(result.get("status", "") or "").upper()
+        msg = (err_detail or str(result.get("response", "") or "")).strip()[:200]
+        low = msg.lower()
+        if "could not be found" in low or "not found" in low or "checkout link" in low:
+            return ("SESSION_EXPIRED", "SESSION_EXPIRED", msg or "Checkout link expired or invalid",
+                    "Checkout link expired or invalid")
+        if top_status == "ERROR" or msg:
+            return ("ERROR", "ERROR", msg or "Square API error", "Square API transport error")
+        return ("UNKNOWN", "UNKNOWN", msg or "Unknown Square response", "Unclassified Square response")
 
-    # Top-level error from sqapi (transport / parse / etc.)
-    top_status = str(result.get("status", "")).upper()
-    if top_status == "ERROR":
-        msg = str(result.get("response", "Square API error"))
-        return ("ERROR", msg[:120], "Square API transport error")
-
-    # Session expired (checkout link invalid)
-    if "could not be found" in str(err_detail).lower() or "not found" in str(err_detail).lower():
-        return ("SESSION_EXPIRED", err_detail, "Checkout link expired or invalid")
-
-    # Unknown — surface whatever Square gave us
-    return ("UNKNOWN",
-            err_detail or str(result.get("response", "Unknown Square response"))[:120],
-            "Unclassified Square response")
+    # ── REAL processor code — surfaced VERBATIM (v78 core rule) ─────────
+    group = str(result.get("status_group", "") or "").strip().upper()
+    if not group:
+        group = _group_from_code(err_code)
+    reason = _REASON_MAP.get(err_code, "") or _GROUP_REASON.get(group, "") \
+        or (err_code.replace("_", " ").title() if group == err_code else "Card declined by issuer")
+    return (err_code, group, err_detail[:200], reason)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -655,7 +715,7 @@ async def square_check_card(card_str: str, user_id: Optional[int] = None,
                 continue
             break
 
-        status, response, reason = _classify_square(chosen, amount_cents)
+        status, status_group, response, reason = _classify_square(chosen, amount_cents)
         elapsed = time.time() - t0
 
         raw = chosen.get("raw", {}) or {}
@@ -667,29 +727,36 @@ async def square_check_card(card_str: str, user_id: Optional[int] = None,
         merchant_id = chosen.get("merchant_id", "")
         checkout_id = chosen.get("checkout_id", "")
 
-        is_approved = (status == "APPROVED")
+        is_approved = (status == "APPROVED" or status_group == "APPROVED")
         is_charged = is_approved
 
+        # v78 — REAL processor code passthrough. `status` is the processor's
+        # own code verbatim (GENERIC_DECLINE, CARD_DECLINED_VERIFICATION_REQUIRED,
+        # CARD_EXPIRED, ...); the friendly bucket lives in `status_group`.
         result = {
             "status":            status,
+            "status_group":      status_group,
+            "error_code":        status,
+            "http_status":       chosen.get("http_status"),
+            "three_ds":          chosen.get("three_ds") or {},
             "card":              card_str,
             "card_brand":        card_brand,
             "price":             f"${amount_cents / 100:.2f}",
             "elapsed":           round(elapsed, 2),
             "response":          response,
             "reason":            reason,
-            "display_response":  _display_response(status, response, payment_id),
+            "display_response":  _display_response(status, status_group, response, payment_id),
             "site":              site,
             "merchant_id":       merchant_id,
             "checkout_id":        checkout_id,
             "amount_cents":      amount_cents,
             "is_charged":        is_charged,
             "is_approved":       is_approved,
-            "is_dead":           status in ("DECLINED", "INVALID_CARD", "EXPIRED_CARD", "CVV_MISMATCH"),
-            "is_retryable":      status in ("ERROR", "SESSION_EXPIRED"),
+            "is_dead":           status_group in ("DECLINED", "INVALID_CARD", "EXPIRED_CARD", "CVV_MISMATCH"),
+            "is_retryable":      status_group in ("ERROR", "SESSION_EXPIRED"),
             "gate":              SQUARE_GATE_LABEL,
             "status_code":       status,
-            "error":             "" if status != "ERROR" else response,
+            "error":             "" if status_group != "ERROR" else response,
             "raw":               raw,
             "time":              chosen.get("time", ""),
         }
@@ -701,7 +768,7 @@ async def square_check_card(card_str: str, user_id: Optional[int] = None,
         #   * 429 from Square → retry with different proxy immediately
         #   * Other ERROR → retry up to MAX_RETRIES
         #   * Non-ERROR → return immediately
-        if status == "ERROR" and attempt < MAX_RETRIES - 1:
+        if status_group == "ERROR" and attempt < MAX_RETRIES - 1:
             if last_was_proxy_error:
                 log.warning(
                     "Square PROXY-ERROR on attempt %d/%d for %s — rotating proxy+api+site",
@@ -724,16 +791,25 @@ async def square_check_card(card_str: str, user_id: Optional[int] = None,
     return last_result or _error_result(card_str, "All retries exhausted", site, amount_cents)
 
 
-def _display_response(status: str, response: str, payment_id: str) -> str:
-    """Build the display_response field shown in the bot message."""
-    if status == "APPROVED" and payment_id:
+def _display_response(status: str, status_group: str, response: str, payment_id: str) -> str:
+    """v78 — the EXACT processor response shown in the bot message.
+
+    APPROVED → "Payment Successful — ID: <id>".
+    Everything else → the REAL processor code verbatim
+    (GENERIC_DECLINE, CARD_DECLINED_VERIFICATION_REQUIRED, CARD_EXPIRED, ...).
+    Only transport errors fall back to the raw message text.
+    """
+    if status_group == "APPROVED" and payment_id:
         return f"Payment Successful — ID: {payment_id}"
+    if status and status not in ("UNKNOWN", "ERROR"):
+        return status                      # ← the REAL code, verbatim
     return response[:120]
 
 
 def _error_result(card_str: str, msg: str, site: str, amount_cents: int) -> dict:
     return {
         "status":            "ERROR",
+        "status_group":      "ERROR",
         "card":              card_str,
         "card_brand":        "?",
         "price":             f"${amount_cents / 100:.2f}",
@@ -938,22 +1014,27 @@ async def _square_bulk_processor(all_ccs: list, user_id: int, user_name: str,
 
         result = last_result or _error_result(cc, "All retries failed", "", amount_cents)
         status = result.get("status", "UNKNOWN")
+        status_group = str(result.get("status_group", "") or "").upper() or \
+            _group_from_code(str(status))
         checked_cards.add(cc)  # v75 — mark as checked
         async with _counters_lock:
             counters["processed"] += 1
             counters["checked"] += 1
-            if status == "APPROVED": counters["approved"] += 1
-            elif status == "3DS_REQUIRED": counters["three_ds"] += 1
-            elif status == "INSUFFICIENT_FUNDS": counters["insufficient"] += 1
-            elif status == "INVALID_CARD": counters["invalid"] += 1
-            elif status == "ERROR": counters["error"] += 1
+            # v78 — categorize by the FRIENDLY bucket (status is the real code now)
+            if status == "APPROVED" or status_group == "APPROVED":
+                counters["approved"] += 1
+            elif status_group == "3DS_REQUIRED": counters["three_ds"] += 1
+            elif status_group == "INSUFFICIENT_FUNDS": counters["insufficient"] += 1
+            elif status_group == "INVALID_CARD": counters["invalid"] += 1
+            elif status_group == "ERROR": counters["error"] += 1
             else: counters["declined"] += 1
             current_processed = counters["processed"]
         response = result.get("response", "-")[:80]
         reason = result.get("reason", "-")[:60]
         price = result.get("price", "$1.00")
         elapsed = result.get("elapsed", 0)
-        all_results.append(f"{cc} | {status} | {price} | {response} | {reason} | {elapsed}s")
+        # v78 — line format: cc | GROUP | price | REAL_CODE | response | reason | elapsed
+        all_results.append(f"{cc} | {status_group} | {price} | {status} | {response} | {reason} | {elapsed}s")
         try: await _save_to_checked_txt(cc, result, user_id, user_name, "msq")
         except: pass
         try: await _square_log_check(result, user_id, user_name, user_uname)
@@ -1188,30 +1269,37 @@ def _square_format_message(result: dict, user_link_html: str = "",
     from bot import wpe, _to_bi, bold, brand_emoji
 
     status = str(result.get("status", "UNKNOWN"))
+    # v78 — friendly bucket drives the header; the REAL code goes in Response:
+    group = str(result.get("status_group", "") or "").upper()
+    if not group:
+        group = _group_from_code(status)
     price = str(result.get("price", f"${amount_cents / 100:.2f}"))
     elapsed = float(result.get("elapsed", 0.0) or 0.0)
     response = str(result.get("response", "-"))
     reason = str(result.get("reason", ""))
-    display_response = str(result.get("display_response") or response)[:120]
+    display_response = str(result.get("display_response") or status or response)[:120]
 
-    # Header — matches the shopify/st1 formatter pattern
-    if status == "APPROVED":
+    # Header — friendly bucket (the exact code is shown in the Response line)
+    if group == "APPROVED":
         header = f"{wpe('approved')} {_to_bi('Square')} {_to_bi('APPROVED')} {wpe('approved')}"
-    elif status == "INSUFFICIENT_FUNDS":
+    elif group == "INSUFFICIENT_FUNDS":
         header = f"{wpe('insufficient')} {_to_bi('Square')} {_to_bi('INSUFFICIENT')} {_to_bi('Live CC')} {wpe('insufficient')}"
-    elif status == "CVV_MISMATCH":
+    elif group == "CVV_MISMATCH":
         header = f"{wpe('warn')} {_to_bi('Square')} {_to_bi('CVV MISMATCH')} {wpe('warn')}"
-    elif status == "INVALID_CARD":
+    elif group == "INVALID_CARD":
         header = f"{wpe('cross')} {_to_bi('Square')} {_to_bi('INVALID CARD')} {wpe('cross')}"
-    elif status == "EXPIRED_CARD":
+    elif group == "EXPIRED_CARD":
         header = f"{wpe('skull')} {_to_bi('Square')} {_to_bi('EXPIRED')} {wpe('skull')}"
-    elif status == "3DS_REQUIRED":
+    elif group == "3DS_REQUIRED":
         header = f"{wpe('warn')} {_to_bi('Square')} {_to_bi('3DS REQUIRED')} {wpe('warn')}"
-    elif status == "ERROR":
+    elif group == "SESSION_EXPIRED":
+        header = f"{wpe('warn')} {_to_bi('Square')} {_to_bi('LINK EXPIRED')} {wpe('warn')}"
+    elif group == "ERROR":
         header = f"{wpe('red_warn')} {_to_bi('Square')} {_to_bi('ERROR')} {wpe('red_warn')}"
-    elif status == "DECLINED":
+    elif group == "DECLINED":
         header = f"{wpe('skull')} {_to_bi('Square')} {_to_bi('DECLINED')} {wpe('skull')}"
     else:
+        # unknown bucket — show the REAL code itself (no invention)
         header = f"{wpe('warn')} {_to_bi('Square')} {_to_bi(status[:60])} {wpe('warn')}"
 
     cc_line = f"{wpe('card')} {_to_bi('CC:')} <code>{cc_str}</code>\n" if cc_str else ""
@@ -1233,10 +1321,24 @@ def _square_format_message(result: dict, user_link_html: str = "",
         checked_by = f"{wpe('checked_by')} {_to_bi('Checked by:')} {bold('Whopex')}"
 
     # v75 — Reason line. APPROVED shows no reason (per spec).
-    if status == "APPROVED":
+    if group == "APPROVED":
         reason_line = ""
     else:
         reason_line = f"{wpe('gem')} {_to_bi('Reason:')} {_to_bi(reason)}\n"
+
+    # v78 — 3DS + HTTP lines from the REAL processor response (non-APPROVED only)
+    extra_line = ""
+    if group != "APPROVED":
+        tds = result.get("three_ds") or {}
+        if isinstance(tds, dict):
+            tds_status = tds.get("three_ds_transaction_status")
+            tds_chal = tds.get("three_ds_issuer_challenged")
+            if tds_status or tds_chal is not None:
+                extra_line += (f"{wpe('warn')} {_to_bi('3DS:')} {_to_bi(str(tds_status or '-'))}"
+                               f" | {_to_bi('Challenged:')} {_to_bi(str(tds_chal))}\n")
+        hs = result.get("http_status")
+        if hs:
+            extra_line += f"{wpe('arrow_right')} {_to_bi('HTTP:')} {_to_bi(str(hs))}\n"
 
     return (
         f"{header}\n\n"
@@ -1246,6 +1348,7 @@ def _square_format_message(result: dict, user_link_html: str = "",
         f"{wpe('time')} {_to_bi('Time:')} {_to_bi(f'{elapsed:.2f}s')}\n"
         f"{wpe('gem')} {_to_bi('Response:')} {_to_bi(display_response)}\n"
         f"{reason_line}"
+        f"{extra_line}"
         f"\n{bin_block}"
         f"{checked_by}\n"
         f"{_to_bi('gate')} : {wpe('sparkle')} {_to_bi('Square')}\n"
@@ -1339,8 +1442,10 @@ async def _square_save_dec_appr(card: str, result: dict, user_id: int,
         from datetime import datetime
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         status = result.get("status", "?")
-        # Only save real verdicts (APPROVED, DECLINED, INSUFFICIENT, etc.) — skip ERROR/UNKNOWN
-        if status in ("ERROR", "UNKNOWN", "SESSION_EXPIRED"):
+        group = str(result.get("status_group", "") or "").upper()
+        # Only save real verdicts — skip transport errors / unknown / dead link
+        if status in ("ERROR", "UNKNOWN", "SESSION_EXPIRED") or \
+           group in ("ERROR", "UNKNOWN", "SESSION_EXPIRED"):
             return
         price = result.get("price", "-")
         response = result.get("response", "-")
